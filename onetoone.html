@@ -1,0 +1,480 @@
+<!DOCTYPE html>
+<html>
+    <head>
+        <title>VideoChat Sample</title>
+        <script type="text/javascript" src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+        <!--src="jquery-3.5.1.min.js"では"Uncaught SyntaxError: Unexpected token '<'"が出てしまう-->
+        <!--まずシグナリング・サーバのJavaScriptライブラリを読み込む-->
+        <script src="https://localhost:8080/socket.io/socket.io.js"></script>
+        <!--後はscript中に'io()'を組み込んでおけばsocket.ioを利用できる-->
+    </head>
+    <body style="background-color: #222;">
+        <div id="wrapper" style="width: 100%;margin: 0 auto;display: flex;flex-wrap: nowrap;"><!--flexで要素を横並びにする-->
+            <div id="remoteVideo" style="margin: 0 auto;width: 75%;background: black">
+                <div id="remoteVideoContainer"></div>
+            </div> 
+            <div style="float: right;margin: 0 auto;width: 25%;">
+                <video id="localVideo" style="text-align: center;padding: 5px;background: black;" width="100%" autoplay="1"></video>
+            </div>
+          
+        </div>
+        
+        <div>
+            <button class="" id="make-call" style="border-style: none;border-radius: 2px;width: 70px;background-color: #248;color:#fff;font-size: 0.5em;margin: 0 0 1em 0;padding:0.5em 0.7em 0.6em 0.7em">Call</button>
+            <button class="" id="end-call" style="border-style: none;border-radius: 2px;width: 70px;background-color: #248;color:#fff;font-size: 0.5em;margin: 0 0 1em 0;padding:0.5em 0.7em 0.6em 0.7em">End</button>
+        </div> 
+        <script type="text/javascript">
+//シグナリングサーバへの接続
+var localStream=null;
+//peerConnection配列
+var peerConnections=[];//連想配列
+//local:ローカル側,remote:リモート側
+var video=document.querySelector('#localVideo');//ここでは#を入れないと読み込まない。getElementById()なら#なしでOK
+//video要素（のポインタ）の配列
+var remoteVideos=[];
+//リモート側の映像の表示場所
+var remoteVideoContainer=document.querySelector('#remoteVideoContainer');
+var constraints={audio:true,video:{width:400,height:300}};
+
+const MAX_CONNECTIONS=1;
+
+//接続の有無
+var connection=true;
+
+var present_remote_id=null;
+
+//多次元配列の初期化
+//for(let i=0;i<MAX_CONNECTIONS;i++){
+//    peerConnections[i]=[,];//8行２列
+//}
+
+//RTCPeerConnectionインターフェース
+//RTCPeerConnection=window.RTCPeerConnection;
+
+//シグナリング・サーバへの接続(フロント側⇒シグナリング・サーバ)
+const port=8080;
+let socket=io.connect('https://localhost:'+port+'/');
+let room='kuckyhawk';
+//'connect'イベントは自動的にsocketの接続を開始する
+socket.on('connect',function(event){
+    //emit()は第１引数にイベントネーム、第２引数以降に任意の変数をとる
+    socket.emit('enter',room);//イベントネーム(ここでは'enter')は基本的に何でもよいが、'connect'などの予約語は使えない
+    console.log('Socket.IO connected. ID:'+socket.id);
+});
+//以下のsocket.on()は接続されていることが前提
+
+//socket.onによるメッセージ処理
+//シグナリング・サーバから送られてきたメッセージをon()で取得する
+socket.on('message',function(message){
+    let from=message.from;//message.fromはIDで区別される
+    //{}で変数スコープを指定する
+    switch(message.type){
+        case 'offer':{
+            console.log('--offer from '+from);
+            let offer=new window.RTCSessionDescription(message);
+            setOffer(from,offer);//シングル接続と違ってリモート方が引数に加わる
+            break;
+        }
+        case 'answer':{
+            console.log('--answer from '+from);
+            let answer=new window.RTCSessionDescription(message);
+            setAnswer(from,answer);
+            break;
+        }
+        case 'candidate':{
+            console.log('--candidate from '+from);
+            console.log('connections:'+Object.keys(peerConnections).length);
+            let candidate=new window.RTCIceCandidate(message.ice);
+            //addIceCandidate(from,candidate);
+            console.log('add ICE cadidate.');
+            if(Object.keys(peerConnections).length>=MAX_CONNECTIONS){
+                console.warn('Too many connections.');
+                console.log('keys:'+Object.keys(peerConnections));
+                break;
+            }
+            if(!isConnected(from)){//getConnection()と同じ?
+                console.warn('Not connected or already closed from id:'+from);
+                break;
+            }
+            let peerConnection=getConnection(from);
+            if(!peerConnection){
+                console.error('PeerConnection does not exist.');
+                break;
+            }
+            //peerConnectionに候補者を加える
+            peerConnection.addIceCandidate(candidate);
+            break;
+        }
+        case 'call'://リモートからの接続要求が来た場合
+            console.log('--call from '+from);
+            console.log('connections:'+Object.keys(peerConnections).length);
+            if(connection==false) break;//接続を切っていた場合はリモート側の接続要求に応えない
+            //startConnection(from);
+            if(!localStream){
+                console.log('Not ready for connecting.');
+                break;
+            }
+            if(Object.keys(peerConnections).length>=MAX_CONNECTIONS){
+                console.warn('Too many connections.');
+                console.log('keys:'+Object.keys(peerConnections));
+                break;
+            }
+            if(isConnected(from)){
+                console.log('already connected.');
+                break;
+            }
+            createOffer(from);//リモートとの接続はofferを生成することから始まる
+            break;
+        case 'bye':
+            console.log('-- bye from '+from);
+            stopConnection(from);
+            break;
+    }
+});
+
+socket.on('user disconnected',function(event){
+    stopConnection(event.id);
+});
+
+//peer connection 関数
+function displayPeerConnections(){
+    console.log('display peer connections list.');
+    Object.keys(peerConnections).forEach(function(key){
+        console.log(key,peerConnections[key]);
+    });//連想配列の表示
+}
+
+function isConnected(id){
+    if(!peerConnections[id]){//連想配列の内容確認('!peerConnections.id'ではうまく行かない)
+        console.log('not connected. ID:'+id);
+        return false;
+    }else{
+        console.log('connected. ID:'+id);
+        return true;
+    }
+    //return peerConnections[id]?true:false;
+}
+
+function addConnection(id,peer){
+    if(peerConnections[id]){
+        console.log('peer already listed.');
+    }else{
+        peerConnections[id]=peer;//連想配列の追加
+        //peerConnections.push([id,peer]);//多次元配列の追加
+        if(peerConnections[id]){
+            console.log('secceeded to add. ID:'+id);
+        }else{
+            console.log('failed to add. ID:'+id);
+        }
+    }    
+}
+
+function getConnection(id){
+    if(isConnected(id)){
+        return peerConnections[id];
+    }else{
+        return null;//JavaScriptではnullとundefinedの区別がある
+    }
+}
+
+function stopConnection(id){
+    detachRemoteVideo(id);
+    //deleteConnection(id);
+    if(isConnected(id)){
+        let peer=getConnection(id);
+        peer.close();
+        delete peerConnections[id];
+    }
+}
+
+function stopAllConnection(){
+    for(let id in peerConnections){
+        detachRemoteVideo(id);
+        if(isConnected(id)){
+            let peer=getConnection(id);
+            peer.close();
+            delete peerConnections[id];
+        }
+        stopConnection(id);
+    }
+}
+
+//remote video 関数
+function attachRemoteVideo(id,stream){    
+    //console.log('add remote video element.');
+    //console.log('create video element.');
+    let video=document.createElement('video');
+    //video.width=window.innerWidth*0.7;
+    video.height=window.innerHeight-100;
+    video.id=id;
+    console.log('video id:'+id);
+    present_remote_id=id;
+    //video.style.border='1px solid black';
+    //video.style.margin='10px'
+    video.style.padding='5px';
+    //video要素をremoteVideoContainerにつけ足す
+    remoteVideoContainer.appendChild(video);
+    remoteVideos[id]=video;//連想配列の追加(array.key=valueもしくはarray[key]=value)
+    video.srcObject=stream;
+    video.play();
+    console.log('attach remote video.');
+}
+
+//ウィンドウリサイズ時のリモート側ビデオのサイズ変更
+window.addEventListener('resize',function(){
+    let video=document.getElementById(present_remote_id);
+    if(video!=null){
+        video.width=window.innerWidth*0.7;
+    }    
+},false)
+
+function detachRemoteVideo(id){
+    if(remoteVideos[id]){
+        remoteVideos[id].pause();
+        delete remoteVideos[id];
+        let video=document.getElementById(id);
+        remoteVideoContainer.removeChild(video);
+    }
+}
+
+function createOffer(id){
+    console.log('create offer.');
+    //peerConnectionは複数になるので、ここで一つずつ生成
+    //接続要求があったIDのメンバーに対して接続を試みる
+    let peerConnection=createPeerConnection(id);
+    //peerConnectionsに加える
+    addConnection(id,peerConnection);
+    //offerの生成
+    peerConnection.createOffer()
+    .then(function(sessionDescription){//sessionDescriptionはcreateOffer()でつくられる(ローカル変数扱い)
+        console.log('type:'+sessionDescription.type);   
+        //SDP(offer)をセットする(setLocalDescriptionでws.onmessageが発火する)
+        return peerConnection.setLocalDescription(sessionDescription);
+    }).then(function(){
+        console.log('set local description.');
+        //Vanilla ICE
+        //何もしない
+        //Trickle ICE
+        //Offer SDPの送信
+        sendSdp(id,peerConnection.localDescription);
+        //引数をsessionDescriptionとするのではうまく行かなかった
+    }).catch(function(error){
+        console.error(error);
+    });
+}
+
+function setOffer(id,sessionDescription){
+    console.log('set offer.');
+    //マルチ接続では既存のpeerConnectionを確認しない
+    //peerConnectionを生成
+    let peerConnection=createPeerConnection(id);//ローカル側もPeerConnectionを生成
+    //peerConnectionsに加える
+    console.log('peer who offered has been added to peerConnections.');
+    addConnection(id,peerConnection);
+    //リモート側のSDP(offer)を生成したRTCPeerConnectionに設定する
+    peerConnection.setRemoteDescription(sessionDescription)
+    .then(function(){
+        console.log('set remote description.');
+        //受信したSDPに対応するSDPを生成
+        createAnswer(id);
+    }).catch(function(error){
+        console.error('(offer)set remote description error: ',error);
+    });
+}
+
+function createAnswer(id){
+    console.log('create answer.');
+    let peerConnection=getConnection(id);
+    if(!peerConnection) return;
+    //answerの生成
+    peerConnection.createAnswer()
+    .then(function(sessionDescription){
+        console.log('type:'+sessionDescription.type);
+        //ローカル側のSPD(answer)をRTCPeerConnectionに設定する
+        return peerConnection.setLocalDescription(sessionDescription);
+    }).then(function(){//ここはシングル接続と同じ
+        console.log('set local description.');
+        //Trickle ICE
+        sendSdp(id,peerConnection.localDescription);
+        //Vanilla ICE
+        //何もしない
+    }).catch(function(error){        
+        console.log(error);
+    });
+}
+
+function setAnswer(id,sessionDescription){
+    console.log('set answer.');
+    //peerConnectionはあるか
+    let peerConnection=getConnection(id);
+    if(!peerConnection) return;
+    //peerConnectionがあればリモート側のsessionDescription(answer)をセットする
+    peerConnection.setRemoteDescription(sessionDescription)
+    .then(function(){
+        console.log('set remote description.');        
+    }).catch(function(error){
+        console.error('(answer)set remote description error: ',error);
+    });
+}
+
+function createPeerConnection(id){
+    //TURN,STUNサーバ。これらがICEサーバにあたる(MDN)
+    let pcConfig={"iceServers":[{"url": "stun:stun.l.google.com:19302"}]};
+    //RTCPeerConnectionを実体化
+    let peer=new RTCPeerConnection(pcConfig);//JQueryでは'peer'で統一されているらしい('peer'でないとJQueryでエラーになる)
+    //RTCPeerConnectionはローカル側、リモート側の接続を表したもの(MDN)
+    //pcConfig(TURN,STUBサーバ)がないとリモート側の映像が余分に映ってしまう 
+    //ストリームがある場合
+    if('ontrack'in peer){
+        console.log('--ontrack--');
+        //ontrackが発火してもWebRTC接続が確立していないとリモート側の音声・映像は再生されない⇒createAnswer(),setAnswer()で接続確立
+        //if(!peer.ontrack){
+        //    console.log('ontrack firing.');
+        //}else{
+        //    console.log('ontrack not firing.');   
+        //}
+        //ontrackイベントは新しいトラックが追加されたときに発火する
+        //'track'とはストリームの構成単位で映像・音声の各トラックを指す   
+        peer.ontrack=function(event){
+            //すでにリモート側の映像・音声ストリームを受信している場合            
+            if(remoteVideos[id]){
+                console.log('already stream attached.');
+            }else{
+                //eventのストリームに接続
+                let stream=event.streams[0];
+                attachRemoteVideo(id,stream);
+            }
+        };
+        console.log('ontrack end.');        
+    }else{
+        console.log('--onaddstream--');
+        //onaddsreamは新しいメディアが追加されると発火するイベントだが、まもなくサポートが切れるらしい
+        peer.onaddstream=function(event){            
+            let stream=event.stream;
+            attachRemoteVideo(id,stream);
+        }
+    }
+    //ICE Candidateの送信(onicecandidateイベントは複数回発生する)
+    peer.onicecandidate=function(event){
+        console.log('on ICE Candidate.');
+        if(event.candidate){//新しい候補者がいる場合
+            //Vanilla ICEの場合(接続候補者が全員そろってから接続リモートを決める)
+            //何もしない
+            //Trickle ICEの場合(接続候補者を見つけ次第接続する)
+            //sendIceCandidate(id,event.candidate);
+            let msg={type:'candidate',ice:event.candidate};
+            if(isConnected(id)){
+                msg.sendto=id;
+                socket.emit('message',msg);//第２引数の構造体に各変数を格納する
+            }else{
+                //Vanilla ICEの場合
+                //sendSdp(peer.localDescription);
+                //Trickle ICEの場合
+                //何もしない
+            }
+        }
+    };
+    peer.oniceconnectionstatechange=function(){
+        switch(peer.iceConnectionState){
+            case 'closed':
+            case 'failed':
+            stopConnection(id);
+            break;
+            case 'disconnected':
+            break;
+        }
+    };
+    peer.onremovestream=function(event){
+        detachRemoteVideo(id);
+    }
+    //localStreamの追加
+    if(localStream){
+        localStream.getTracks().forEach(track=>peer.addTrack(track,localStream));
+        //peer.addStream(localStream);//addStreamは非推奨になっている
+    }
+    return peer;
+}
+
+function sendSdp(id,sessionDescription){
+    console.log('send SDP to '+id);
+    //シグナリング・サーバにSDPを送る
+    let msg={type: sessionDescription.type,sdp: sessionDescription.sdp};
+    //シングル接続のときはJSON.stringify()を使用していた
+    //messageToOne(id,msg);
+    msg.sendto=id;
+    socket.emit('message',msg);//第２引数の構造体に各変数を格納する
+}
+
+function hangUp(){
+    socket.emit('message',{type: 'bye'});//シグナリング・サーバのsocket.on('message')へ
+    stopAllConnection();
+}
+
+$(function(){
+//$(function(){})でHTML全文を読み込むまで処理を保留する。jsをbodyの下部に置くならこのコードは不要
+    //showMyVideo();
+    connect();
+    $('#make-call').click(function(){//MAKE CALLボタンが押された場合の処理
+        console.log('call');
+        if(peerConnections.length>=MAX_CONNECTIONS) return;
+        connection=true;
+        socket.emit('message',{type:'call'});
+        //val()でinputされたIDを取得
+        //var called_id=$('#called-id').val();
+        //リモートにローカルのストリームを渡すと同時にリモート側のIDに発信する
+        //var call=peer.call(called_id,localStream);
+        //peerメソッドでは第2引数,第3引数はオプション
+        //showPeerVideo(call);
+    });
+    $('#end-call').click(function(){
+        hangUp();
+        connection=false;
+        console.log('disconnected');
+    });
+});
+
+async function connect(){
+    console.log('connect.');
+    //mediaStreamが来るより前にconnect()に行ってしまうため、非同期処理にする
+    await navigator.mediaDevices.getUserMedia(constraints)
+    .then(function(mediaStream){
+        if(mediaStream) console.log('media stream.');
+        localStream=mediaStream;        
+        video.srcObject=mediaStream;
+        video.onloadedmetadata=function(e){
+            video.play();
+        };
+    }).catch(function(error){
+        console.error('mediaDevices.getUserMedia error:',error);
+    });
+    if(localStream){
+        console.log('local stream generated.');
+    }else{
+        console.log('local stream not generated.');
+    }
+    socket.emit('message',{type:'call'});
+}
+
+function showMyVideo(){
+    console.log('show my video.');    
+    navigator.mediaDevices.getUserMedia(constraints)
+    .then(function(mediaStream){
+        if(mediaStream) console.log('media stream.');
+        localStream=mediaStream;        
+        video.srcObject=mediaStream;
+        video.onloadedmetadata=function(e){
+            video.play();
+        };
+    }).catch(function(error){
+        console.error('mediaDevices.getUserMedia error:',error);
+    });
+    if(localStream){
+        console.log('local stream generated.');
+    }else{
+        console.log('local stream not generated.');
+    }
+};
+        </script>
+    </body>
+
+</html>
